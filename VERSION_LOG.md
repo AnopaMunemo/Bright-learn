@@ -16,8 +16,72 @@ Known issues carried: <bugs still present>
 
 ---
 
-## v9 — TBD — Design pivoted by bake-off result
-Status: design phase.
+## v9 — 2026-05-28 — `versions/v9_goldbot.py` — Drawdown-control overlay (shipped, partially passing)
+Asset: XAUUSD (`GC=F`), CLI `--ticker` swappable
+
+Status: SHIPPED. Honest verdict below — it succeeds at its mission (cuts drawdown ~44%) but at too high a Sharpe cost in this build. v9.1 will tune.
+
+### What changed
+- **Architecture pivot**: no longer a directional timing bot. Base position = 1.0 (= hold gold). Modulators multiplicatively scale weight in [0.5, 1.0]; final weight = `base × min(m_regime, m_vol, m_drawdown, m_dxy)` (min, not product, so a single signal doesn't over-shrink).
+- **Modulator stack** (each ∈ [0.5, 1.0]):
+  - `m_regime` — HMM Bull/Calm/Crisis. Crisis → 0.55. Confidence < 0.55 → 0.80 backoff.
+  - `m_vol` — `clip(target_vol / realized_vol, 0.5, 1.0)`. Target 18% annual.
+  - `m_drawdown` — linear brake: 1.0 at DD ≥ −8%, floor 0.5 at DD ≤ −20%.
+  - `m_dxy` — 0.75 when 10-day DXY trend > +2.5% (USD breakout), else 1.0.
+- **HMM/GARCH cadence honored**: HMM refits every 63 bars inside the walk-forward (not every bar). GARCH only fits once per run for the dashboard.
+- **Minimum-deposit calculator**: takes (historical max DD from this backtest, user's max acceptable DD, buffer-to-retain in USD, safety margin) → recommended deposit floor.
+- **Profit-target halt** + NAV state persistence (`state/{ticker}_equity.json`). Bot halts when NAV ≥ initial × (1 + target).
+
+### Fixed
+- v8 ML look-ahead leak: v9 doesn't retrain ML at all (the bake-off showed v8's `ml_logistic` ran Sharpe −1.19 — drop it entirely rather than fix it).
+- Hard-coded ticker — now only in `Config`, CLI-swappable.
+- Daily HMM refit (carried from earlier versions) — now 63-bar cadence.
+
+### Removed
+- Directional timing layer.
+- ML logistic model (will return only if a longer-horizon target proves predictive in walk-forward).
+- 13-feature ensemble vote (also Sharpe-negative in the bake-off).
+
+### Measured (real `GC=F`, 2015-01-01 → 2026-05-28, 2866 bars, net of 3 bps/side)
+
+| Metric | v9 | Buy & Hold | Δ |
+|---|---|---|---|
+| CAGR | 7.6% | 14.6% | **−7.0%** |
+| Sharpe | 0.35 | 0.61 | **−0.26** |
+| MaxDD | **−12.0%** | −20.9% | **+8.8 pts ✓** |
+| Calmar | 0.63 | 0.70 | −0.07 |
+| Trades | 5 | 2 | — |
+| Final NAV (from $10k) | $21,438 | $48,470* | — |
+
+\* B&H final NAV approximated from `0.146` CAGR × 11.4y, gross of post-warmup window — actual figure varies with warm-up alignment but is unambiguously higher than v9's.
+
+**Standards gate (per CLAUDE.md §3):**
+1. ✗ Net Sharpe ≤ B&H — bot output says so plainly (`✗ v9 fails its mission`).
+2. ✓ Net-of-friction throughout (3 bps/side).
+3. ✓ Walk-forward, expanding window, no look-ahead. HMM refit cadence 63d.
+4. ✓ Real `GC=F` from yfinance (not synthetic).
+5. ✓ Honest report — Sharpe + CAGR + DD + Calmar + trades all printed.
+6. ✓ `random_state=42` everywhere.
+7. ✓ This entry.
+
+**Bottom line**: v9 ✓ reduces drawdown by 44% (the design intent) but ✗ pays −0.26 Sharpe for it. The Calmar barely shifted. The bot is **not** an improvement over just holding XAUUSD on a risk-adjusted basis yet — it's a partial step.
+
+### Root cause of the Sharpe drag
+On the final bar the modulator stack returned `final = 0.80`, driven entirely by `m_regime = 0.80` (HMM confidence 48% < 0.55 threshold). This pattern repeats through most of the history: HMM posterior confidence on a 3-state mixture rarely exceeds 55% even in strong bull regimes, so the bot capped its weight at 0.80 for most of the bull market, dragging CAGR by ~7%. The realized drawdown reduction is real, but it came from this same persistent under-sizing — not from intelligently dodging crashes.
+
+### v9.1 plan (next iteration, do not ship as v10)
+- Skip the low-confidence backoff entirely when `reg_idx == 0` (Bull) — only apply it to Calm.
+- Lower the low-conf threshold from 0.55 → 0.45.
+- Make the backoff less severe (0.90 instead of 0.80) when it does fire.
+- Goal for v9.1: keep MaxDD within 2 pts of v9 (−14% or better) while clawing CAGR back above 11%.
+
+### Known issues carried
+- HMM convergence warnings on long histories (cosmetic; the model still produces usable posteriors but you'll see "Model is not converging" from `hmmlearn`).
+- B&H comparison uses a single buy-at-warmup-start lump-sum, not periodic; fine for direction-of-improvement but not a perfect apples-to-apples NAV.
+- Profit-target halt reads persisted NAV from the in-script backtest's final value, which mixes simulated and live state — fine for the v9 paper-mode but must be tightened before v11 broker integration.
+- No stress-test sub-windows yet (2008, 2020-03, 2022-Q1). v9.1 should add these.
+
+---
 
 ### Bake-off result (2026-05-28, real XAUUSD `GC=F` 2015-01-01 → today, 2866 bars, 3 bps/side friction)
 
