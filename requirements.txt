@@ -6,3 +6,7 @@ numpy>=1.26.0
 # Portfolio optimizer
 scipy>=1.11.0
 hmmlearn>=0.3.0   # optional — graceful fallback if absent
+
+# Dashboard (app.py)
+streamlit>=1.30.0
+plotly>=5.18.0

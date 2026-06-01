@@ -285,6 +285,7 @@ class PortfolioOptimizer:
         self.bundle  = data_bundle
         self._log    = logging.getLogger("portfolio_optimizer.engine")
         self._constraints = self._build_constraints()
+        self._port_ret: pd.Series = pd.Series(dtype=float)   # set during build()
 
     # ── Constraints ────────────────────────────────────────────────────────
 
@@ -422,9 +423,10 @@ class PortfolioOptimizer:
             pr  = float(np.dot(w, adj_mean))
             pv  = float(np.sqrt(np.dot(w, cov_mat @ w) + 1e-12))
             sr  = (pr - rfr) / pv
-            dpr = adj_mean
-            dpv = cov_mat @ w / pv
-            return -(dpr * pv - sr * dpv) / pv
+            dpr = adj_mean            # d(portfolio return)/dw
+            dpv = cov_mat @ w / pv    # d(portfolio vol)/dw
+            # d(Sharpe)/dw = (dpr - sr·dpv) / pv  →  negate for minimisation
+            return -(dpr - sr * dpv) / pv
 
         w0 = np.full(n, 1.0 / n)
         cap = min(self.req.max_single_position, self._constraints.max_single_pos)
@@ -565,6 +567,42 @@ class PortfolioOptimizer:
         p90   = float(np.percentile(final_rets, 90))
         return prob, med, p10, p90
 
+    def probability_matrix(
+        self,
+        months_list:  List[int],
+        targets_list: List[float],
+        port_ret:     Optional[pd.Series] = None,
+    ) -> pd.DataFrame:
+        """
+        Build a full probability matrix for the dashboard's Probability Module.
+
+        Rows    = target returns (e.g. 0.05, 0.10, 0.20 …)
+        Columns = hold horizons in months
+        Cell    = P(cumulative return ≥ target over that horizon)
+
+        Drives the "Hold for X months for a Y% likelihood of Z% profit" panel.
+        Call after build() so the cached portfolio return series is available.
+        """
+        series = port_ret if port_ret is not None else self._port_ret
+        if series is None or series.empty:
+            return pd.DataFrame()
+
+        matrix: Dict[int, List[float]] = {}
+        for m in months_list:
+            col: List[float] = []
+            for tgt in targets_list:
+                prob, *_ = self.monte_carlo(series, tgt, m)
+                col.append(round(prob, 4))
+            matrix[m] = col
+
+        df = pd.DataFrame(
+            matrix,
+            index=[f"{t:.0%}" for t in targets_list],
+        )
+        df.index.name   = "target_return"
+        df.columns.name = "hold_months"
+        return df
+
     # ── Build result ──────────────────────────────────────────────────────
 
     def build(self) -> PortfolioResult:
@@ -683,6 +721,8 @@ class PortfolioOptimizer:
         if not fi_ret.empty and len(fi_weights) == len(fi_ret.columns):
             fi_series = (fi_ret * fi_weights).sum(axis=1) * target_fi_frac
             port_ret  = port_ret.add(fi_series, fill_value=0)
+
+        self._port_ret = port_ret   # cache for probability_matrix()
 
         ann_ret = float(port_ret.mean() * 252) if not port_ret.empty else 0.0
         ann_vol = float(port_ret.std() * np.sqrt(252)) if not port_ret.empty else 0.01

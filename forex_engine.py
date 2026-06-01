@@ -167,6 +167,7 @@ class RecoverySizer:
         sl_distance:     float,   # price distance from entry to SL
         tp_distance:     float,   # price distance from entry to TP
         pip_value:       Optional[float] = None,
+        pip_size:        Optional[float] = None,   # price units per pip (e.g. 0.0001)
     ) -> Tuple[float, float, bool, float]:
         """
         Returns
@@ -178,8 +179,11 @@ class RecoverySizer:
         self._peak_equity = max(self._peak_equity, account_equity)
 
         pv = pip_value or self.cfg.pip_value_std
-        sl_dist_pips = sl_distance / (10 ** -self.cfg.pip_digits)
-        tp_dist_pips = tp_distance / (10 ** -self.cfg.pip_digits)
+        # pip_size defaults to the generic 4-digit convention; callers pass the
+        # correct value per instrument (JPY pairs 0.01, metals 0.1, etc.)
+        ps = pip_size if pip_size is not None else (10 ** -self.cfg.pip_digits)
+        sl_dist_pips = sl_distance / ps
+        tp_dist_pips = tp_distance / ps
 
         # Circuit breaker
         drawdown = (self._peak_equity - account_equity) / self._peak_equity
@@ -201,19 +205,29 @@ class RecoverySizer:
         else:
             lot_size = base_lot
 
-        # Hard cap: SL risk must not exceed max_single_risk_pct
-        max_risk_usd   = account_equity * self.cfg.max_single_risk_pct
+        # Hard cap: SL risk must not exceed max_single_risk_pct.
+        # The risk cap ALWAYS wins — we never floor up to the 0.01 minimum lot
+        # if doing so would breach the cap (critical for small accounts, e.g.
+        # an R300 starting balance, where 0.01 standard lots would over-leverage).
+        max_risk_usd    = account_equity * self.cfg.max_single_risk_pct
         max_lot_by_risk = max_risk_usd / (sl_dist_pips * pv + 1e-9)
         lot_size        = min(lot_size, max_lot_by_risk)
-        lot_size        = max(lot_size, 0.01)   # minimum 0.01 lots
 
+        min_lot = 0.01
+        if min_lot <= max_lot_by_risk:
+            lot_size = max(lot_size, min_lot)
+        # else: account too small for the minimum standard lot — fall back to a
+        # micro/nano lot sized strictly by the risk cap (4-decimal precision).
+
+        # 4-decimal rounding preserves micro/nano lots for small accounts
+        lot_size    = round(max(lot_size, 0.0), 4)
         dollar_risk = lot_size * sl_dist_pips * pv
 
         self._log.debug(
-            "Size: equity=$%.0f deficit=$%.2f lot=%.2f risk=$%.2f recovery=%s",
+            "Size: equity=$%.0f deficit=$%.2f lot=%.4f risk=$%.2f recovery=%s",
             account_equity, self._deficit, lot_size, dollar_risk, in_recovery,
         )
-        return round(lot_size, 2), round(dollar_risk, 2), in_recovery, round(self._deficit, 2)
+        return lot_size, round(dollar_risk, 2), in_recovery, round(self._deficit, 2)
 
     def record_result(self, pnl_usd: float) -> None:
         """Call after each closed trade to update the running deficit."""
@@ -273,6 +287,24 @@ class ForexSignalEngine:
 
     def _label(self, ticker: str) -> str:
         return self.PAIR_LABELS.get(ticker, ticker)
+
+    @staticmethod
+    def _pip_size(ticker: str) -> float:
+        """
+        Price units that constitute one pip, per instrument convention:
+          • JPY pairs (…JPY=X)  → 0.01
+          • Gold (XAU)          → 0.10
+          • Silver (XAG)        → 0.01
+          • all other FX majors → 0.0001
+        """
+        t = ticker.upper()
+        if "JPY" in t:
+            return 0.01
+        if "XAU" in t:
+            return 0.10
+        if "XAG" in t:
+            return 0.01
+        return 0.0001
 
     # ── Indicator helpers ─────────────────────────────────────────────────
 
@@ -448,6 +480,7 @@ class ForexSignalEngine:
             account_equity=self.equity,
             sl_distance=sl_dist,
             tp_distance=tp_dist,
+            pip_size=self._pip_size(ticker),
         )
 
         return ForexSignal(
@@ -543,8 +576,10 @@ class ForexSignalEngine:
             sl, tp    = sig.stop_loss, sig.take_profit
             sl_dist   = abs(entry - sl)
             tp_dist   = abs(entry - tp)
+            pip_size  = self._pip_size(ticker)
 
-            lot, risk, in_rec, deficit = sizer.size_trade(equity, sl_dist, tp_dist)
+            lot, risk, in_rec, deficit = sizer.size_trade(
+                equity, sl_dist, tp_dist, pip_size=pip_size)
 
             outcome    = "OPEN"
             exit_price = float(future["Close"].iloc[-1])
@@ -561,9 +596,9 @@ class ForexSignalEngine:
                     if bar["Low"] <= tp:
                         outcome = "TP"; exit_price = tp; break
 
-            # PnL calculation (simplified; pip_value=10 per lot)
+            # PnL calculation (pip_value per lot, instrument-correct pip size)
             price_move = (exit_price - entry) if sig.direction == "LONG" else (entry - exit_price)
-            pnl_pips   = price_move / (10 ** -cfg.pip_digits)
+            pnl_pips   = price_move / pip_size
             pnl_usd    = pnl_pips * cfg.pip_value_std * lot
 
             equity    += pnl_usd
